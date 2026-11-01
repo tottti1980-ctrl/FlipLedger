@@ -32,4 +32,4 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__=='__main__':
     port=int(os.environ.get('PORT','8765'))
     print(f'FlipLedger V6 at http://localhost:{port} (AI configured: {bool(os.environ.get("OPENAI_API_KEY"))})')
-    ThreadingHTTPServer(('127.0.0.1',port),Handler).serve_forever()
+    ThreadingHTTPServer(('0.0.0.0',port),Handler).serve_forever()
