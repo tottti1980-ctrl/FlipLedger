@@ -10,7 +10,8 @@ from collections import deque
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlsplit, parse_qs
 from urllib.request import Request, urlopen
 
 HERE = Path(__file__).resolve().parent
@@ -19,6 +20,61 @@ REQUESTS = deque()
 DAILY = {'date': date.today().isoformat(), 'count': 0}
 MAX_PER_DAY = 20
 MAX_PER_MINUTE = 3
+EBAY_TOKEN = {'value': '', 'expires_at': 0}
+
+
+def ebay_access_token():
+    """Application token for public Browse API searches (not seller OAuth)."""
+    with LOCK:
+        if EBAY_TOKEN['value'] and time.monotonic() < EBAY_TOKEN['expires_at']:
+            return EBAY_TOKEN['value']
+    client_id = os.environ.get('EBAY_CLIENT_ID', '').strip()
+    client_secret = os.environ.get('EBAY_CLIENT_SECRET', '').strip()
+    if not client_id or not client_secret:
+        raise RuntimeError('eBay Production credentials not configured on Render.')
+    credentials = base64.b64encode(f'{client_id}:{client_secret}'.encode()).decode()
+    body = urlencode({'grant_type': 'client_credentials',
+                      'scope': 'https://api.ebay.com/oauth/api_scope'}).encode()
+    request = Request('https://api.ebay.com/identity/v1/oauth2/token', data=body,
+                      headers={'Authorization': 'Basic ' + credentials,
+                               'Content-Type': 'application/x-www-form-urlencoded'},
+                      method='POST')
+    with urlopen(request, timeout=20) as response:
+        data = json.load(response)
+    token = data['access_token']
+    expires = max(60, int(data.get('expires_in', 7200)) - 120)
+    with LOCK:
+        EBAY_TOKEN.update(value=token, expires_at=time.monotonic() + expires)
+    return token
+
+
+def ebay_search(query):
+    token = ebay_access_token()
+    url = ('https://api.ebay.com/buy/browse/v1/item_summary/search?' +
+           urlencode({'q': query, 'limit': 10, 'filter': 'buyingOptions:{FIXED_PRICE}'}))
+    request = Request(url, headers={
+        'Authorization': 'Bearer ' + token,
+        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_AU',
+        'Accept': 'application/json'
+    })
+    with urlopen(request, timeout=25) as response:
+        data = json.load(response)
+    items = []
+    for item in data.get('itemSummaries', []):
+        price = item.get('price') or {}
+        if price.get('currency') != 'AUD':
+            continue
+        items.append({
+            'title': item.get('title', ''),
+            'price': price.get('value', ''),
+            'currency': 'AUD',
+            'condition': item.get('condition', ''),
+            'url': item.get('itemWebUrl', ''),
+            'shipping': 'Not included; check listing',
+        })
+    return {'query': query, 'marketplace': 'EBAY_AU',
+            'price_type': 'ACTIVE_ASKING_PRICES_NOT_SOLD',
+            'items': items}
 
 class Handler(BaseHTTPRequestHandler):
     def send_headers(self, status, content_type, length, extra=None):
@@ -62,7 +118,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.authorised():
             return
-        if self.path not in ('/', '/index.html'):
+        path = urlsplit(self.path)
+        if path.path == '/api/ebay/search':
+            values = parse_qs(path.query)
+            query = values.get('q', [''])[0].strip()
+            if len(query) < 2 or len(query) > 120:
+                return self.reply(400, {'error': 'Search query must be 2–120 characters.'})
+            try:
+                return self.reply(200, ebay_search(query))
+            except RuntimeError as error:
+                return self.reply(503, {'error': str(error)})
+            except HTTPError as error:
+                print('eBay API HTTP status:', error.code, flush=True)
+                return self.reply(502, {'error': 'eBay API returned HTTP ' + str(error.code) + '. Check Production credentials and Browse API access.'})
+            except (URLError, TimeoutError, ValueError, KeyError) as error:
+                print('eBay API request failed:', type(error).__name__, flush=True)
+                return self.reply(502, {'error': 'eBay request failed. Check Render logs.'})
+        if path.path not in ('/', '/index.html') or path.query:
             return self.reply(404, {'error': 'Not found'})
         try:
             content = (HERE / 'index.html').read_bytes()
