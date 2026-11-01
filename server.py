@@ -1,35 +1,128 @@
-"""FlipLedger V6 local AI vision backend. Requires OPENAI_API_KEY in environment."""
-import base64, json, os, re
-from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
-from urllib.request import Request, urlopen
+"""FlipLedger V7 private test server. No secrets belong in this file."""
+import base64
+import hmac
+import json
+import os
+import re
+import threading
+import time
+from collections import deque
+from datetime import date
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
-class Handler(SimpleHTTPRequestHandler):
-    def do_POST(self):
-        if self.path != '/api/identify':
-            self.send_error(404); return
-        if not os.environ.get('OPENAI_API_KEY'):
-            return self.reply(503, {'error':'AI service not configured. Set OPENAI_API_KEY on the server.'})
+HERE = Path(__file__).resolve().parent
+LOCK = threading.Lock()
+REQUESTS = deque()
+DAILY = {'date': date.today().isoformat(), 'count': 0}
+MAX_PER_DAY = 20
+MAX_PER_MINUTE = 3
+
+class Handler(BaseHTTPRequestHandler):
+    def send_headers(self, status, content_type, length, extra=None):
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(length))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('X-Frame-Options', 'DENY')
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+
+    def reply(self, code, data):
+        out = json.dumps(data).encode('utf-8')
+        self.send_headers(code, 'application/json; charset=utf-8', len(out))
+        self.wfile.write(out)
+
+    def authorised(self):
+        password = os.environ.get('FLIPLEDGER_PASSWORD', '')
+        if not password:
+            self.reply(503, {'error': 'Private testing password not configured on Render.'})
+            return False
+        header = self.headers.get('Authorization', '')
         try:
-            length=int(self.headers.get('Content-Length','0'))
-            if length < 1 or length > 9_000_000: return self.reply(413, {'error':'Image too large (max 6 MB).'})
-            obj=json.loads(self.rfile.read(length))
-            image=obj.get('image','')
-            if not re.match(r'^data:image/(jpeg|png|webp);base64,',image): return self.reply(400, {'error':'Use a JPEG, PNG or WebP image.'})
-            if len(image)>8_500_000:return self.reply(413,{'error':'Image too large.'})
-            payload={'model':os.environ.get('FLIPLEDGER_VISION_MODEL','gpt-4.1-mini'), 'messages':[{'role':'system','content':'Identify resale items from photos. Never invent editions or condition. Respond ONLY with a JSON object with keys title, category, edition, confidence, notes. Category must be one of DVD / Blu-ray, Video games, Collectibles, Electronics, Clothing & accessories, Other. confidence must be low, medium, or high. Use empty string for unknown title or edition. Title should be concise and suitable for an eBay listing, max 80 characters.'},{'role':'user','content':[{'type':'text','text':'Identify this item based only on what is visible. If uncertain, state uncertainty in notes.'},{'type':'image_url','image_url':{'url':image}}]}], 'response_format':{'type':'json_object'},'max_tokens':350}
-            req=Request('https://api.openai.com/v1/chat/completions',data=json.dumps(payload).encode(),headers={'Authorization':'Bearer '+os.environ['OPENAI_API_KEY'],'Content-Type':'application/json'})
-            with urlopen(req,timeout=50) as resp: result=json.load(resp)
-            answer=json.loads(result['choices'][0]['message']['content'])
-            self.reply(200,{k:answer.get(k,'') for k in ['title','category','edition','confidence','notes']})
-        except HTTPError as e:
-            self.reply(502,{'error':'AI provider returned an error ('+str(e.code)+'). Check server configuration and billing.'})
-        except Exception:
-            self.reply(500,{'error':'Recognition failed. Check the server log and try again.'})
-    def reply(self,code,data):
-        out=json.dumps(data).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(out)));self.end_headers();self.wfile.write(out)
+            scheme, value = header.split(' ', 1)
+            if scheme.lower() != 'basic':
+                raise ValueError('Invalid scheme')
+            credentials = base64.b64decode(value, validate=True).decode('utf-8')
+            username, submitted = credentials.split(':', 1)
+            if username == 'flipledger' and hmac.compare_digest(submitted, password):
+                return True
+        except (ValueError, UnicodeError):
+            pass
+        body = b'Private FlipLedger test. Sign in to continue.'
+        self.send_headers(401, 'text/plain; charset=utf-8', len(body), {'WWW-Authenticate': 'Basic realm="FlipLedger private test", charset="UTF-8"'})
+        self.wfile.write(body)
+        return False
 
-if __name__=='__main__':
-    port=int(os.environ.get('PORT','8765'))
-    print(f'FlipLedger V6 at http://localhost:{port} (AI configured: {bool(os.environ.get("OPENAI_API_KEY"))})')
-    ThreadingHTTPServer(('0.0.0.0',port),Handler).serve_forever()
+    def do_GET(self):
+        if not self.authorised():
+            return
+        if self.path not in ('/', '/index.html'):
+            return self.reply(404, {'error': 'Not found'})
+        try:
+            content = (HERE / 'index.html').read_bytes()
+        except OSError:
+            return self.reply(503, {'error': 'index.html missing from server directory'})
+        self.send_headers(200, 'text/html; charset=utf-8', len(content))
+        self.wfile.write(content)
+
+    def do_POST(self):
+        if not self.authorised():
+            return
+        if self.path != '/api/identify':
+            return self.reply(404, {'error': 'Not found'})
+        api_key = os.environ.get('OPENAI_API_KEY', '')
+        if not api_key:
+            return self.reply(503, {'error': 'AI key not configured yet.'})
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            if length < 1 or length > 9_000_000:
+                return self.reply(413, {'error': 'Photo too large or missing.'})
+            obj = json.loads(self.rfile.read(length))
+            image = obj.get('image', '')
+            if not isinstance(image, str) or not re.fullmatch(r'data:image/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+', image):
+                return self.reply(400, {'error': 'Please use a JPEG, PNG or WebP image.'})
+            if len(image) > 8_500_000:
+                return self.reply(413, {'error': 'Image too large.'})
+            # The limit is shared across all users and resets when the service restarts.
+            with LOCK:
+                now = time.monotonic()
+                today = date.today().isoformat()
+                if DAILY['date'] != today:
+                    DAILY.update(date=today, count=0)
+                while REQUESTS and now - REQUESTS[0] > 60:
+                    REQUESTS.popleft()
+                if DAILY['count'] >= MAX_PER_DAY or len(REQUESTS) >= MAX_PER_MINUTE:
+                    return self.reply(429, {'error': 'Testing request limit reached. Please try later.'})
+                DAILY['count'] += 1
+                REQUESTS.append(now)
+            payload = {
+                'model': os.environ.get('FLIPLEDGER_VISION_MODEL', 'gpt-4.1-mini'),
+                'messages': [
+                    {'role': 'system', 'content': 'Identify resale items from photos. Never invent editions or condition. Respond ONLY with a JSON object with keys title, category, edition, confidence, notes. Category must be one of DVD / Blu-ray, Video games, Collectibles, Electronics, Clothing & accessories, Other. confidence must be low, medium, or high. Use empty string for unknown title or edition. Title should be concise and suitable for an eBay listing, max 80 characters.'},
+                    {'role': 'user', 'content': [{'type': 'text', 'text': 'Identify this item based only on what is visible. If uncertain, state uncertainty in notes.'}, {'type': 'image_url', 'image_url': {'url': image}}]}
+                ],
+                'response_format': {'type': 'json_object'},
+                'max_tokens': 350
+            }
+            request = Request('https://api.openai.com/v1/chat/completions', data=json.dumps(payload).encode(), headers={'Authorization': 'Bearer ' + api_key, 'Content-Type': 'application/json'})
+            with urlopen(request, timeout=50) as response:
+                result = json.load(response)
+            answer = json.loads(result['choices'][0]['message']['content'])
+            self.reply(200, {key: answer.get(key, '') for key in ('title', 'category', 'edition', 'confidence', 'notes')})
+        except HTTPError as error:
+            self.reply(502, {'error': 'AI provider returned error ' + str(error.code) + '. Check billing and model access.'})
+        except (ValueError, json.JSONDecodeError):
+            self.reply(400, {'error': 'Invalid request data.'})
+        except Exception:
+            self.reply(500, {'error': 'Recognition failed. Check server logs.'})
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', '8765'))
+    print('FlipLedger private testing server on port', port, flush=True)
+    ThreadingHTTPServer(('0.0.0.0', port), Handler).serve_forever()
