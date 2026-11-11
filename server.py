@@ -74,6 +74,9 @@ def ebay_search(query):
         })
     return {'query': query, 'marketplace': 'EBAY_AU',
             'price_type': 'ACTIVE_ASKING_PRICES_NOT_SOLD',
+            'verified_sold': False,
+            'valuation_available': False,
+            'warning': 'These are active asking prices, NOT completed sales. Do not use as verified sold comparables.',
             'items': items}
 
 class Handler(BaseHTTPRequestHandler):
@@ -119,6 +122,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorised():
             return
         path = urlsplit(self.path)
+        if path.path == '/api/ebay/sold':
+            return self.reply(503, {
+                'price_type': 'VERIFIED_SOLD_UNAVAILABLE',
+                'verified_sold': False,
+                'items': [],
+                'error': 'Verified eBay sold data is not connected. Active listings cannot substitute for completed sales.'
+            })
         if path.path == '/api/ebay/search':
             values = parse_qs(path.query)
             query = values.get('q', [''])[0].strip()
@@ -176,7 +186,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = {
                 'model': os.environ.get('FLIPLEDGER_VISION_MODEL', 'gpt-4.1-mini'),
                 'messages': [
-                    {'role': 'system', 'content': 'Identify resale items from photos. Never invent editions or condition. Respond ONLY with a JSON object with keys title, category, edition, confidence, notes. Category must be one of DVD / Blu-ray, Video games, Collectibles, Electronics, Clothing & accessories, Other. confidence must be low, medium, or high. Use empty string for unknown title or edition. Title should be concise and suitable for an eBay listing, max 80 characters.'},
+                    {'role': 'system', 'content': 'Identify resale items strictly from visible photo evidence. Read brand, exact model number, platform, region, format, edition, disc count and barcode only when clearly visible. Do not guess missing details, authenticity, completeness, working condition or sealed status. Distinguish similar-looking models and editions; if exact identification is uncertain, say what label or extra photo is needed in notes. Respond ONLY with a JSON object with keys title, category, edition, confidence, notes. Category must be one of DVD / Blu-ray, Video games, Collectibles, Electronics, Clothing & accessories, Other. confidence must be low, medium, or high. Use empty string for unknown title or edition. Title must be descriptive, factual and at most 80 characters.'},
                     {'role': 'user', 'content': [{'type': 'text', 'text': 'Identify this item based only on what is visible. If uncertain, state uncertainty in notes.'}, {'type': 'image_url', 'image_url': {'url': image}}]}
                 ],
                 'response_format': {'type': 'json_object'},
